@@ -15,8 +15,10 @@ demo-linkedin.*
 # vhs scratch output, wherever it lands
 .vhs-trash.gif
 
-# Agent worktrees and scratch — never part of the repo
-.claude/
+# Agent worktrees, local settings and scratch — never part of the repo.
+# Shared skills under .claude/skills/ are tracked.
+.claude/*
+!.claude/skills/
 
 # Profiling output
 perf.data
