@@ -160,11 +160,15 @@ pub struct ConnTracker {
     worker: Option<crate::sandbox::worker::WorkerHandle>,
 }
 
+type ConnectHook = Box<dyn Fn(u32) + Send>;
+
 /// Where the drain thread copies each connect, for the flow log. Empty until
 /// someone subscribes; a full queue counts instead of blocking the drain.
 #[derive(Default)]
 struct Tap {
     tx: Mutex<Option<SyncSender<crate::collectors::flow_log::ConnectSeen>>>,
+    /// Told each connect's pid, before the line is queued.
+    on_connect: Mutex<Option<ConnectHook>>,
     dropped: AtomicU64,
     repeats: Mutex<Repeats>,
 }
@@ -208,6 +212,11 @@ impl Tap {
         if self.repeats.lock().is_ok_and(|mut r| r.is_repeat(evt)) {
             return;
         }
+        if let Ok(hook) = self.on_connect.lock() {
+            if let Some(hook) = hook.as_ref() {
+                hook(evt.tgid);
+            }
+        }
         let Ok(guard) = self.tx.lock() else { return };
         let Some(tx) = guard.as_ref() else { return };
         let seen = crate::collectors::flow_log::ConnectSeen {
@@ -238,6 +247,14 @@ impl ConnTracker {
             *slot = Some(tx);
         }
         rx
+    }
+
+    /// Call `hook` with the pid of each connect the tap passes on, on the
+    /// drain thread: it must not block.
+    pub fn on_connect(&self, hook: impl Fn(u32) + Send + 'static) {
+        if let Ok(mut slot) = self.tap.on_connect.lock() {
+            *slot = Some(Box::new(hook));
+        }
     }
 
     /// Connects the subscriber's queue had no room for, since the last call.

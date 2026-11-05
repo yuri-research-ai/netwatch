@@ -413,6 +413,12 @@ impl ConnectionCollector {
         self
     }
 
+    /// The socket-ownership broker, when one is attached.
+    #[cfg(target_os = "linux")]
+    pub fn proc_broker(&self) -> Option<Arc<ProcBroker>> {
+        self.proc_broker.clone()
+    }
+
     /// Run `program` in place of `ss`, to exercise the `/proc/net` fallback.
     #[cfg(all(target_os = "linux", test))]
     pub(crate) fn with_ss_program(mut self, program: &'static str) -> Self {
@@ -1974,9 +1980,59 @@ fn overlay_proc_attribution(connections: &mut [Connection], brokered: Option<&Pr
 /// every capability but the two that scan needs before it reads anything
 /// (`worker::relinquish`). It holds no strong reference to itself, so its
 /// thread exits when the collector is dropped.
+///
+/// It also keeps each process's [`ProcessImage`], which takes the same
+/// capabilities to read: for every socket owner a scan finds, and for any pid
+/// [`ProcBroker::request_image`] names. A request is a pid and nothing else;
+/// the broker reads only that process's two `/proc` links for it.
 #[cfg(target_os = "linux")]
 pub struct ProcBroker {
     latest: RwLock<Option<Arc<ProcSnapshot>>>,
+    images: Mutex<HashMap<u32, CachedImage>>,
+    requests: std::sync::mpsc::SyncSender<u32>,
+}
+
+/// Where a process runs from: its executable and working directory, from
+/// `/proc/<pid>/exe` and `/proc/<pid>/cwd`. Reading either for another user's
+/// process takes `CAP_SYS_PTRACE`, so only the [`ProcBroker`] reads them. An
+/// executable replaced or deleted since the process started ends in
+/// ` (deleted)`, as the kernel prints it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProcessImage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+struct CachedImage {
+    start_token: String,
+    image: ProcessImage,
+    learned: Instant,
+}
+
+/// Images kept, and for how long after they were read. A connect line asks
+/// for its process's a tick or two after the request; a flow, when its owner
+/// is learned.
+#[cfg(target_os = "linux")]
+const MAX_IMAGES: usize = 8192;
+#[cfg(target_os = "linux")]
+const IMAGE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+#[cfg(target_os = "linux")]
+const IMAGE_REQUESTS: usize = 1024;
+
+#[cfg(target_os = "linux")]
+fn read_image(pid: u32) -> ProcessImage {
+    let link = |name: &str| {
+        std::fs::read_link(format!("/proc/{pid}/{name}"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    };
+    ProcessImage {
+        exe: link("exe"),
+        cwd: link("cwd"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1985,21 +2041,39 @@ impl ProcBroker {
     /// first snapshot is taken here, on that thread, so owners are available
     /// before the broker's own thread first scans one `interval` later.
     pub fn start(interval: std::time::Duration) -> Arc<Self> {
+        let (requests, pids) = std::sync::mpsc::sync_channel(IMAGE_REQUESTS);
+        let snapshot = capture_proc_snapshot();
         let broker = Arc::new(Self {
-            latest: RwLock::new(Some(Arc::new(capture_proc_snapshot()))),
+            latest: RwLock::new(None),
+            images: Mutex::new(HashMap::new()),
+            requests,
         });
+        broker.publish(snapshot);
         let weak = Arc::downgrade(&broker);
         let spawned = std::thread::Builder::new()
             .name("netwatch-proc-broker".into())
             .spawn(move || {
                 crate::sandbox::worker::relinquish("proc-broker");
+                let mut next_scan = Instant::now() + interval;
                 loop {
-                    std::thread::sleep(interval);
+                    // Requests between scans; the broker's own sender keeps
+                    // the queue open until the broker is dropped.
+                    match pids.recv_timeout(next_scan.saturating_duration_since(Instant::now())) {
+                        Ok(pid) => {
+                            let Some(broker) = weak.upgrade() else {
+                                break;
+                            };
+                            broker.learn_image(pid);
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                     let Some(broker) = weak.upgrade() else {
                         break;
                     };
-                    let snapshot = Arc::new(capture_proc_snapshot());
-                    *safe_write(&broker.latest, "proc_broker::publish") = Some(snapshot);
+                    broker.publish(capture_proc_snapshot());
+                    next_scan = Instant::now() + interval;
                 }
             });
         if let Err(error) = spawned {
@@ -2010,6 +2084,75 @@ impl ProcBroker {
 
     pub fn latest(&self) -> Option<Arc<ProcSnapshot>> {
         safe_read(&self.latest, "proc_broker::latest").clone()
+    }
+
+    fn publish(&self, snapshot: ProcSnapshot) {
+        let owners: HashSet<(u32, String)> = snapshot
+            .entries
+            .values()
+            .map(|(_, o)| (o.identity.pid, o.identity.start_token.clone()))
+            .collect();
+        for (pid, token) in owners {
+            self.learn_image_of(pid, token);
+        }
+        *safe_write(&self.latest, "proc_broker::publish") = Some(Arc::new(snapshot));
+    }
+
+    /// Ask for `pid`'s image to be read soon, on the broker's thread. Never
+    /// blocks; a request the full queue has no room for is dropped.
+    pub fn request_image(&self, pid: u32) {
+        let _ = self.requests.try_send(pid);
+    }
+
+    /// `pid`'s image, if the broker has read it and `pid` is not now a later
+    /// process. One that has exited keeps its image until it ages out.
+    pub fn image(&self, pid: u32) -> Option<ProcessImage> {
+        let images = safe_lock(&self.images, "proc_broker::image");
+        let cached = images.get(&pid)?;
+        match super::attribution::proc_start_token(pid) {
+            Some(now) if now != cached.start_token => None,
+            _ => Some(cached.image.clone()),
+        }
+    }
+
+    fn learn_image(&self, pid: u32) {
+        if let Some(token) = super::attribution::proc_start_token(pid) {
+            self.learn_image_of(pid, token);
+        }
+    }
+
+    /// Read and keep `pid`'s image, unless it is known already for this
+    /// start. The start is checked again after the read, so a pid reused
+    /// meanwhile is not given the earlier process's image.
+    fn learn_image_of(&self, pid: u32, start_token: String) {
+        {
+            let images = safe_lock(&self.images, "proc_broker::learn");
+            if images
+                .get(&pid)
+                .is_some_and(|c| c.start_token == start_token)
+            {
+                return;
+            }
+        }
+        let image = read_image(pid);
+        if super::attribution::proc_start_token(pid).as_deref() != Some(&start_token) {
+            return;
+        }
+        let mut images = safe_lock(&self.images, "proc_broker::learn");
+        if images.len() >= MAX_IMAGES {
+            images.retain(|_, c| c.learned.elapsed() < IMAGE_TTL);
+            if images.len() >= MAX_IMAGES {
+                return;
+            }
+        }
+        images.insert(
+            pid,
+            CachedImage {
+                start_token,
+                image,
+                learned: Instant::now(),
+            },
+        );
     }
 }
 
@@ -4445,5 +4588,37 @@ mod proc_net_tests {
         let parsed: Vec<_> = parse_proc_net_table(&text).collect();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].inode, 7);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod image_tests {
+    use super::*;
+
+    /// A requested pid's executable and working directory are read on the
+    /// broker's thread, and a pid now held by a later process gets none.
+    #[test]
+    fn the_broker_reads_a_requested_process_image() {
+        let broker = ProcBroker::start(std::time::Duration::from_secs(3600));
+        let me = std::process::id();
+        broker.request_image(me);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let image = loop {
+            if let Some(image) = broker.image(me) {
+                break image;
+            }
+            assert!(Instant::now() < deadline, "no image for {me}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(image.exe.as_deref(), Some(exe.to_string_lossy().as_ref()));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(image.cwd.as_deref(), Some(cwd.to_string_lossy().as_ref()));
+
+        safe_lock(&broker.images, "test")
+            .get_mut(&me)
+            .unwrap()
+            .start_token = "0".into();
+        assert_eq!(broker.image(me), None, "another process's image");
     }
 }

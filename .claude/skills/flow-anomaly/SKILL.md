@@ -39,7 +39,7 @@ fails with `Permission denied`, say so and do not change permissions.
    organisations.
    `users` is the effective uid, `euid/uid` when they differ, and `<-auid` when the login
    user is someone else: `0<-1013` is root run by user 1013 through `sudo`. `in` counts
-   inbound connections.
+   inbound connections. Under each row, `exe` lists the executables the process ran from.
 3. **Inbound, by local port.** Connections the far side started (`direction: "in"`), by
    the listening port they came to, with the busiest clients. They are left out of every
    outbound check: an inbound flow's remote port is the client's ephemeral port, and its
@@ -56,6 +56,8 @@ fails with `Permission denied`, say so and do not change permissions.
 | `long-dns-names` | high | Many DNS names with very long names or labels. Possible DNS tunnel. mDNS and `.local` names are skipped. |
 | `many-unique-names` | high | Many distinct names under one domain. Possible DGA or tunnel. |
 | `many-ports` | high | One process hits many ports on one host. Port-scan shape. |
+| `exe-in-scratch-dir` | high / medium | The process runs a binary from `/dev/shm` (high), `/tmp`, `/var/tmp` or `/run/user` (medium). Dropped payloads run from there; so do some installers and test builds. |
+| `deleted-executable` | medium | The binary was deleted or replaced after the process started. Normal for a long-running service after a package upgrade; also how malware hides its file. |
 | `dns-to-unknown-resolver` | medium | DNS sent to a public IP that is not a known resolver. Can mean malware or a hijacked resolver. |
 | `nxdomain-heavy` | medium | Many NXDOMAIN answers. Often DGA probing. |
 | `new-destinations` | low / medium | Destinations not seen in the baseline. Medium when there are many. |

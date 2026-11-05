@@ -4,7 +4,7 @@
 # The package itself depends on nothing; install it with
 # `sudo apt install ./target/netwatch_<version>_amd64.deb`.
 #
-#   scripts/build-deb.sh [DEB_VERSION]      # default: <crate version>+flowlog1
+#   scripts/build-deb.sh [DEB_VERSION]      # default: <crate version>+flowlog6
 #
 # Build dependencies, all from apt:
 #   sudo apt install musl-tools flex bison make curl file binutils dpkg-dev linux-libc-dev
@@ -26,7 +26,7 @@ LIBPCAP_VERSION=1.10.5
 LIBPCAP_SHA256=37ced90a19a302a7f32e458224a00c365c117905c2cd35ac544b6880a81488f0
 CRATE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 RUST_VERSION="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-DEB_VERSION="${1:-${CRATE_VERSION}+flowlog1}"
+DEB_VERSION="${1:-${CRATE_VERSION}+flowlog6}"
 MAINTAINER="Iurii Kolesov <iurii.kolesov@alberblanc.com>"
 WORK="$ROOT/target/deb-build"
 

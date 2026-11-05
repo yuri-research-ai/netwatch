@@ -28,7 +28,9 @@ All notable changes to NetWatch will be documented in this file.
 - **Who and which way in the flow log.** Lines with an owner carry `uid`, `euid` and `auid`
   (the login user, kept across `sudo`). TCP `open` and `close` say `direction`: `in` for a
   connection to a listening port here, `out` otherwise. A `connect` from a worker thread is
-  named after its process, with the thread in `thread`.
+  named after its process, with the thread in `thread`. With the proc-broker, lines also carry
+  the process's `exe` and `cwd`; it reads them for each socket owner it scans and for each
+  `connect`'s pid as the event arrives.
 - One UDP `connect()` is one `connect` line: the copies the wrapper and inner datagram probes
   both report are dropped, and `ts` comes from the kernel's clock.
 - **The packaged unit grants `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH`**, which only the

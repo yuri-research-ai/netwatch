@@ -154,6 +154,12 @@
         "auid": {
           "$ref": "#/$defs/auid"
         },
+        "exe": {
+          "$ref": "#/$defs/exe"
+        },
+        "cwd": {
+          "$ref": "#/$defs/cwd"
+        },
         "attribution": {
           "type": "string",
           "description": "How the owner was matched. ebpf: polling found no owner, and one process alone connected to this destination within five seconds, per the connect probes; a verified owner on a later poll replaces it. Open set.",
@@ -348,6 +354,12 @@
         "auid": {
           "$ref": "#/$defs/auid"
         },
+        "exe": {
+          "$ref": "#/$defs/exe"
+        },
+        "cwd": {
+          "$ref": "#/$defs/cwd"
+        },
         "attribution": {
           "const": "ebpf"
         },
@@ -455,6 +467,12 @@
         "auid": {
           "$ref": "#/$defs/auid"
         },
+        "exe": {
+          "$ref": "#/$defs/exe"
+        },
+        "cwd": {
+          "$ref": "#/$defs/cwd"
+        },
         "attribution": {
           "type": "string",
           "description": "How the owner was matched. Absent with a null process. Open set.",
@@ -552,6 +570,14 @@
       "type": "integer",
       "minimum": 0,
       "description": "The owning process's login uid (/proc/<pid>/loginuid): the user who logged in, kept across sudo and su. Absent when unset, as for a service started at boot."
+    },
+    "exe": {
+      "type": "string",
+      "description": "The owning process's executable, from /proc/<pid>/exe as the proc-broker read it; ends in \" (deleted)\" when the file was replaced or removed after the process started. Absent when the broker is not running (no CAP_SYS_PTRACE for other users' processes, or not Linux) or had not read it."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "The owning process's working directory, from /proc/<pid>/cwd, read with exe. Absent when exe is, or the process had none."
     }
   }
 }

@@ -15,7 +15,7 @@
 //! them is bounded; what does not fit is counted and reported as a `dropped`
 //! line rather than held.
 
-use super::connections::{AttributionSource, Connection};
+use super::connections::{AttributionSource, Connection, ProcessImage};
 use super::geo::{GeoCache, GeoInfo};
 use super::packets::DnsCache;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
@@ -161,6 +161,8 @@ pub struct FlowEvent {
     pub pid: Option<u32>,
     #[serde(flatten)]
     pub creds: Option<Creds>,
+    #[serde(flatten)]
+    pub image: Option<ProcessImage>,
     pub attribution: AttributionSource,
     pub local: String,
     pub remote: String,
@@ -265,6 +267,8 @@ pub struct ConnectLine {
     pub thread: Option<String>,
     #[serde(flatten)]
     pub creds: Option<Creds>,
+    #[serde(flatten)]
+    pub image: Option<ProcessImage>,
     pub attribution: AttributionSource,
     /// The client side of the captured stream this connect started, when
     /// one was found.
@@ -442,6 +446,7 @@ fn connect_line(c: ConnectSeen, stream: Option<&WireStream>) -> ConnectLine {
         pid: c.pid,
         thread: c.thread,
         creds: c.creds,
+        image: None,
         attribution: AttributionSource::Ebpf,
         local: stream.map(|w| w.client.to_string()),
         remote: c.remote.to_string(),
@@ -529,6 +534,7 @@ struct FlowState {
     process: Option<String>,
     pid: Option<u32>,
     creds: Option<Creds>,
+    image: Option<ProcessImage>,
     attribution: AttributionSource,
     direction: Option<&'static str>,
     state: String,
@@ -554,6 +560,7 @@ impl FlowState {
             process: None,
             pid: None,
             creds: None,
+            image: None,
             attribution,
             direction: None,
             state: String::new(),
@@ -606,6 +613,7 @@ impl FlowTracker {
         dns: &DnsCache,
         hint: OwnerHint,
         dns_name: &dyn Fn(&str) -> Option<String>,
+        image: &dyn Fn(u32) -> Option<ProcessImage>,
     ) -> Vec<FlowEvent> {
         self.observe_at(
             connections,
@@ -615,6 +623,7 @@ impl FlowTracker {
             &|ip| geo.lookup(ip),
             hint,
             dns_name,
+            image,
         )
     }
 
@@ -627,6 +636,7 @@ impl FlowTracker {
         geo: &dyn Fn(&str) -> Option<GeoInfo>,
         hint: OwnerHint,
         dns_name: &dyn Fn(&str) -> Option<String>,
+        image: &dyn Fn(u32) -> Option<ProcessImage>,
     ) -> Vec<FlowEvent> {
         let elapsed = self
             .last_observe
@@ -673,6 +683,12 @@ impl FlowTracker {
             // gone by the close.
             if flow.pid.is_some() && flow.pid != pid {
                 flow.creds = flow.pid.and_then(self.creds);
+                flow.image = None;
+            }
+            // The broker reads an image at its next scan or request, which
+            // can be a tick after the owner is known: ask until it has one.
+            if flow.image.is_none() {
+                flow.image = flow.pid.and_then(image);
             }
             if is_new {
                 events.push(event(&key, flow, FlowEventKind::Open, &ts, now, None));
@@ -914,6 +930,7 @@ fn event(
         process: flow.process.clone(),
         pid: flow.pid,
         creds: flow.creds,
+        image: flow.image.clone(),
         attribution: flow.attribution,
         local: key.local.clone(),
         remote: key.remote.clone(),
@@ -1060,6 +1077,8 @@ pub struct DnsLine {
     pub pid: Option<u32>,
     #[serde(flatten)]
     pub creds: Option<Creds>,
+    #[serde(flatten)]
+    pub image: Option<ProcessImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attribution: Option<AttributionSource>,
     pub local: String,
@@ -1223,6 +1242,7 @@ fn dns_line(p: PendingDns, owner: SocketOwner) -> DnsLine {
         process,
         pid,
         creds: None,
+        image: None,
         attribution,
         local: p.client.to_string(),
         server: p.server.to_string(),
@@ -1273,6 +1293,9 @@ pub struct DaemonFlowLog {
     names: NameCache,
     /// Local sockets the connect lines named, with when that stops counting.
     owners: HashMap<std::net::SocketAddr, (u32, String, Instant)>,
+    /// Where each process's executable and working directory come from.
+    #[cfg(target_os = "linux")]
+    broker: Option<std::sync::Arc<super::connections::ProcBroker>>,
 }
 
 impl DaemonFlowLog {
@@ -1292,6 +1315,19 @@ impl DaemonFlowLog {
             .map(|t| t.subscribe(CONNECT_QUEUE_CAP));
         #[cfg(not(feature = "ebpf"))]
         let connects = None;
+        #[cfg(target_os = "linux")]
+        let broker = app.connection_collector.proc_broker();
+        // Each connect asks the broker for its process's image at once, so a
+        // process that exits before its line is written still has one.
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let (Some(tracker), Some(broker)) = (&app.conn_tracker, &broker) {
+            let broker = std::sync::Arc::downgrade(broker);
+            tracker.on_connect(move |pid| {
+                if let Some(b) = broker.upgrade() {
+                    b.request_image(pid);
+                }
+            });
+        }
         Self {
             tracker: FlowTracker::new(config.loopback),
             writer: FlowWriter::start(config, sources(ebpf)),
@@ -1300,6 +1336,20 @@ impl DaemonFlowLog {
             dns: DnsJoin::new(config.loopback),
             names: NameCache::default(),
             owners: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            broker,
+        }
+    }
+
+    fn image(&self, pid: u32) -> Option<ProcessImage> {
+        #[cfg(target_os = "linux")]
+        {
+            self.broker.as_ref()?.image(pid)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
         }
     }
 
@@ -1351,12 +1401,27 @@ impl DaemonFlowLog {
             }
         };
         let names = &self.names;
+        // Not `self.image`: the tracker below is borrowed mutably.
+        #[cfg(target_os = "linux")]
+        let broker = self.broker.clone();
+        let image = |pid: u32| -> Option<ProcessImage> {
+            #[cfg(target_os = "linux")]
+            {
+                broker.as_ref()?.image(pid)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = pid;
+                None
+            }
+        };
         let events = self.tracker.observe(
             &app.connection_collector.connections(),
             &app.geo_cache,
             &app.packet_collector.dns_cache,
             &hint,
             &|ip| names.lookup(ip, now),
+            &image,
         );
         self.writer.send(&events);
     }
@@ -1366,6 +1431,7 @@ impl DaemonFlowLog {
     fn annotate(&mut self, lines: &mut [ConnectLine], now: SystemTime) {
         let until = Instant::now() + SOCKET_OWNER_TTL;
         for line in lines {
+            line.image = self.image(line.pid);
             if let Some(ip) = line
                 .remote
                 .rsplit_once(':')
@@ -1410,6 +1476,7 @@ impl DaemonFlowLog {
         let mut lines = self.dns.tick(&owner, all);
         for line in &mut lines {
             line.creds = line.pid.and_then(proc_creds);
+            line.image = line.pid.and_then(|pid| self.image(pid));
         }
         self.writer.send(&lines);
     }
@@ -1778,6 +1845,10 @@ mod tests {
         None
     }
 
+    fn no_image(_: u32) -> Option<ProcessImage> {
+        None
+    }
+
     struct Clock {
         start: Instant,
         wall: SystemTime,
@@ -1804,7 +1875,16 @@ mod tests {
         conns: &[Connection],
     ) -> Vec<FlowEvent> {
         let (now, wall) = clock.at(secs);
-        t.observe_at(conns, now, wall, &no_rdns, &no_geo, &no_hint, &no_name)
+        t.observe_at(
+            conns,
+            now,
+            wall,
+            &no_rdns,
+            &no_geo,
+            &no_hint,
+            &no_name,
+            &|_| None,
+        )
     }
 
     const LOCAL: &str = "10.0.0.5:51234";
@@ -1912,6 +1992,33 @@ mod tests {
         bare.process_name = None;
         let json = serde_json::to_value(&observe(&mut t, &clock, 2, &[bare])[0]).unwrap();
         assert!(json.get("uid").is_none());
+    }
+
+    /// The image is asked for until the broker has it, then kept: the close
+    /// of a flow whose process has gone still says where it ran from.
+    #[test]
+    fn a_flow_takes_its_owners_image_once_the_broker_has_it() {
+        let clock = Clock::new();
+        let mut t = FlowTracker::new(false);
+        let table = [conn(LOCAL, REMOTE, "ESTABLISHED")];
+        let curl = |pid: u32| {
+            (pid == 4242).then(|| ProcessImage {
+                exe: Some("/usr/bin/curl".into()),
+                cwd: Some("/home/iurii".into()),
+            })
+        };
+        let mut step = |secs, table: &[Connection], image: &dyn Fn(u32) -> Option<ProcessImage>| {
+            let (now, wall) = clock.at(secs);
+            t.observe_at(
+                table, now, wall, &no_rdns, &no_geo, &no_hint, &no_name, image,
+            )
+        };
+        assert_eq!(step(0, &table, &no_image)[0].image, None);
+        assert!(step(1, &table, &curl).is_empty());
+        let close = step(2, &[], &no_image);
+        let json = serde_json::to_value(&close[0]).unwrap();
+        assert_eq!(json["exe"], "/usr/bin/curl");
+        assert_eq!(json["cwd"], "/home/iurii");
     }
 
     #[test]
@@ -2031,6 +2138,7 @@ mod tests {
             },
             &no_hint,
             &no_name,
+            &no_image,
         );
         let close = &close[0];
         assert_eq!(close.process.as_deref(), Some("curl"));
@@ -2066,6 +2174,7 @@ mod tests {
             },
             &no_hint,
             &no_name,
+            &no_image,
         );
         let close = observe(&mut t, &clock, 1, &[]);
         assert_eq!(close[0].rdns.as_deref(), Some("fra16s.1e100.net"));
@@ -2287,7 +2396,16 @@ mod tests {
             assert_eq!((proto, ip, port), ("TCP", "142.250.66.101", 443));
             Some((4242, "curl".to_string()))
         };
-        let open = t.observe_at(&[c.clone()], now, wall, &no_rdns, &no_geo, &hint, &no_name);
+        let open = t.observe_at(
+            &[c.clone()],
+            now,
+            wall,
+            &no_rdns,
+            &no_geo,
+            &hint,
+            &no_name,
+            &no_image,
+        );
         assert_eq!(open[0].process.as_deref(), Some("curl"));
         assert_eq!(open[0].pid, Some(4242));
         assert_eq!(open[0].attribution, AttributionSource::Ebpf);
@@ -2304,7 +2422,16 @@ mod tests {
         let mut other = conn(LOCAL, REMOTE, "ESTABLISHED");
         other.process_name = None;
         other.pid = Some(1);
-        let open = t.observe_at(&[other], now, wall, &no_rdns, &no_geo, &hint, &no_name);
+        let open = t.observe_at(
+            &[other],
+            now,
+            wall,
+            &no_rdns,
+            &no_geo,
+            &hint,
+            &no_name,
+            &no_image,
+        );
         assert_eq!(
             open[0].process, None,
             "pid 1 in the table, 4242 in the hint"
@@ -2702,6 +2829,7 @@ mod tests {
             },
             &|proto, _, _| (proto == "UDP").then(|| (99, "quic-client".into())),
             &|ip| (ip == "142.250.66.101").then(|| "www.google.com".to_string()),
+            &no_image,
         );
         assert!(events
             .iter()

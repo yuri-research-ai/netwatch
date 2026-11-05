@@ -370,6 +370,32 @@ def check_dns(recent, out, t):
                                    f"{n} distinct names under {domain}, possible DGA or tunnelling"))
 
 
+# Writable scratch directories: a binary run from one was dropped there.
+EXE_DIRS_HIGH = ("/dev/shm/",)
+EXE_DIRS_MEDIUM = ("/tmp/", "/var/tmp/", "/run/user/")
+
+
+def check_executables(recent, out):
+    """Processes running a deleted binary, or one from a scratch directory."""
+    per: dict[tuple[str, str, str], set[str]] = collections.defaultdict(set)
+    for e in recent:
+        exe = e.get("exe")
+        if not exe or e["event"] not in CONN_TYPES + ("dns",):
+            continue
+        dest = e.get("remote") or e.get("server") or ""
+        if exe.endswith(" (deleted)"):
+            per[("medium", "deleted-executable", proc(e))].add(f"{exe} -> {dest}")
+        path = exe.removesuffix(" (deleted)")
+        if path.startswith(EXE_DIRS_HIGH):
+            per[("high", "exe-in-scratch-dir", proc(e))].add(f"{exe} -> {dest}")
+        elif path.startswith(EXE_DIRS_MEDIUM):
+            per[("medium", "exe-in-scratch-dir", proc(e))].add(f"{exe} -> {dest}")
+    for (sev, check, p), seen in per.items():
+        summary = ("runs a binary deleted or replaced since it started"
+                   if check == "deleted-executable" else "runs a binary from a writable scratch directory")
+        out.append(finding(sev, check, p, f"{summary}, {len(seen)} connection(s)", sorted(seen)[:5]))
+
+
 def check_dropped(recent, out):
     dropped = sum(int(e.get("count") or 0) for e in recent if e["event"] == "dropped")
     if dropped:
@@ -383,9 +409,12 @@ def check_dropped(recent, out):
 def group_by_process(recent: list[dict]) -> dict[str, dict]:
     groups: dict[str, dict] = collections.defaultdict(
         lambda: {"opens": 0, "inbound": 0, "dests": set(), "ports": collections.Counter(),
-                 "orgs": collections.Counter(), "users": collections.Counter(), "up": 0, "down": 0})
+                 "orgs": collections.Counter(), "users": collections.Counter(),
+                 "exes": collections.Counter(), "up": 0, "down": 0})
     for e in recent:
         g = groups[proc(e)]
+        if e.get("exe"):
+            g["exes"][e["exe"]] += 1
         if user_of(e):
             g["users"][user_of(e)] += 1
         if e["event"] == "open":
@@ -472,6 +501,7 @@ def analyse(events: list[dict], args: argparse.Namespace) -> dict:
     check_dns_resolvers(recent, findings)
     check_dns(recent, findings, t)
     check_dropped(recent, findings)
+    check_executables(recent, findings)
     findings.sort(key=lambda f: SEV_ORDER[f["severity"]])
 
     procs = group_by_process(recent)
@@ -489,6 +519,7 @@ def analyse(events: list[dict], args: argparse.Namespace) -> dict:
         "processes": [
             {"process": p, "risk": risk.get(p, 0), "opens": g["opens"], "inbound": g["inbound"],
              "destinations": len(g["dests"]), "users": [u for u, _ in g["users"].most_common(3)],
+             "exes": [x for x, _ in g["exes"].most_common(3)],
              "up": g["up"], "down": g["down"],
              "top_ports": g["ports"].most_common(3), "top_orgs": g["orgs"].most_common(3)}
             for p, g in sorted(procs.items(), key=lambda kv: (-risk.get(kv[0], 0), -kv[1]["up"]))
@@ -532,6 +563,8 @@ def render(report: dict, stats: collections.Counter, top: int) -> str:
         users = ",".join(p["users"])
         lines.append(f"{p['process'][:21]:<22}{users[:13]:<14}{p['risk']:>6}{p['opens']:>8}{p['inbound']:>6}"
                      f"{p['destinations']:>7}{human(p['up']):>11}{human(p['down']):>11}  {ports} | {orgs}")
+        if p["exes"]:
+            lines.append(f"{'':<22}exe {', '.join(p['exes'])}")
 
     lines.append("")
     lines.append("== Inbound, by local port ==")

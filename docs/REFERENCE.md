@@ -590,7 +590,13 @@ tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.eve
   login uid from `/proc/<pid>/loginuid`, the user who logged in, kept across `sudo` and `su`
   (`"uid":0,"euid":0,"auid":1013` is root, run by user 1013). They are read when the owner is
   learned: for a `connect` as the event arrives, for a flow when it opens. A process gone by
-  then has none. Numbers only; map them to names with `getent passwd`.
+  then has none. Numbers only; map them to names with `getent passwd`. They also have `exe`
+  and `cwd`, the process's executable and working directory. Reading those for another
+  user's process takes `CAP_SYS_PTRACE`, so the proc-broker reads them: for every socket
+  owner at each scan, and for each `connect`'s process as the event arrives, so even a
+  process that lives a few milliseconds has them. An `exe` ending in ` (deleted)` was
+  replaced or removed after the process started, as after a package upgrade, or by a
+  program hiding its binary.
 - **What it skips.** Listening and unconnected sockets, and loopback unless
   `flow_log_loopback = true`.
 - **Limits.** The log is built from the connection table, polled every `refresh_rate_ms`.

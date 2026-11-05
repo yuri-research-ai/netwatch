@@ -198,7 +198,10 @@ write: /dev/null
    a process boundary ([worker](../src/sandbox/worker.rs#L1)).
 2. ProcBroker stays outside Landlock to scan procfs. Wave 1 limits its capabilities
    to ptrace and DAC read/search; it is still privileged
-   ([broker policy](../src/sandbox/linux.rs#L160)).
+   ([broker policy](../src/sandbox/linux.rs#L160)). It also takes pids from the eBPF
+   drain thread, over a bounded queue, and reads those processes' `exe` and `cwd`
+   links for the flow log. A request carries only a pid, but a compromised drain
+   thread can learn any process's executable and working directory through it.
 3. The SDK reader inherits the eBPF worker's layers but keeps its creation-time
    load capabilities; it has no separate entry hook
    ([eBPF startup](../src/ebpf/conn_tracker.rs#L130)).

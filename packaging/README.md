@@ -27,8 +27,8 @@ a unit, that means adding the flag to `ExecStart` or `ProgramArguments`.
 ## Debian / Ubuntu package with the connection log (this fork)
 
 ```sh
-scripts/build-deb.sh                     # → target/netwatch_<version>+flowlog1_amd64.deb
-sudo apt install ./target/netwatch_*+flowlog1_amd64.deb
+scripts/build-deb.sh                     # → target/netwatch_<version>+flowlogN_amd64.deb
+sudo apt install ./target/netwatch_*_amd64.deb
 sudo tail -f /var/log/netwatch/flows.$(date -u +%F).ndjson
 ```
 

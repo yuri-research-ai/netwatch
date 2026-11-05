@@ -38,6 +38,12 @@ pub fn same_process(observed: Option<&ProcessIdentity>, expected: &ProcessIdenti
         && (observed.network_namespace.is_none()
             || observed.network_namespace == expected.network_namespace)
 }
+/// A process's start time, from `/proc/<pid>/stat`, which anyone may read:
+/// with the pid, it tells a process from a later one given the same pid.
+#[cfg(target_os = "linux")]
+pub fn proc_start_token(pid: u32) -> Option<String> {
+    start_token(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
 /// Read start identity on both sides of executable discovery. No persistent PID cache.
 #[cfg(target_os = "linux")]
 pub fn process_identity(pid: u32) -> Option<ProcessIdentity> {
