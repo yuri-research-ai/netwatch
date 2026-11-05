@@ -145,6 +145,15 @@
           "minimum": 0,
           "description": "The owning process's id. Null when unknown."
         },
+        "uid": {
+          "$ref": "#/$defs/uid"
+        },
+        "euid": {
+          "$ref": "#/$defs/euid"
+        },
+        "auid": {
+          "$ref": "#/$defs/auid"
+        },
         "attribution": {
           "type": "string",
           "description": "How the owner was matched. ebpf: polling found no owner, and one process alone connected to this destination within five seconds, per the connect probes; a verified owner on a later poll replaces it. Open set.",
@@ -164,6 +173,13 @@
         "remote": {
           "type": "string",
           "description": "Remote address and port, as the connection table prints it."
+        },
+        "direction": {
+          "enum": [
+            "in",
+            "out"
+          ],
+          "description": "TCP only, set when the flow opens. in: the local side is a port a socket was listening on, so the far side connected here; remote then holds the client's port. out: this host connected. Absent for UDP. Closed set."
         },
         "state": {
           "type": "string",
@@ -319,6 +335,19 @@
           "minimum": 0,
           "description": "The process id (thread-group id) that called connect()."
         },
+        "thread": {
+          "type": "string",
+          "description": "The comm of the thread that called connect(), when it is not the process's: process is then the main thread's comm. Absent when they are the same."
+        },
+        "uid": {
+          "$ref": "#/$defs/uid"
+        },
+        "euid": {
+          "$ref": "#/$defs/euid"
+        },
+        "auid": {
+          "$ref": "#/$defs/auid"
+        },
         "attribution": {
           "const": "ebpf"
         },
@@ -417,6 +446,15 @@
           ],
           "minimum": 0
         },
+        "uid": {
+          "$ref": "#/$defs/uid"
+        },
+        "euid": {
+          "$ref": "#/$defs/euid"
+        },
+        "auid": {
+          "$ref": "#/$defs/auid"
+        },
         "attribution": {
           "type": "string",
           "description": "How the owner was matched. Absent with a null process. Open set.",
@@ -499,6 +537,21 @@
           "const": "capture"
         }
       }
+    },
+    "uid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The owning process's real user id, read from /proc/<pid>/status when the owner was learned. Absent when the process was already gone or the platform has no /proc."
+    },
+    "euid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The owning process's effective user id; differs from uid for a setuid program. Present exactly when uid is."
+    },
+    "auid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The owning process's login uid (/proc/<pid>/loginuid): the user who logged in, kept across sudo and su. Absent when unset, as for a service started at boot."
     }
   }
 }

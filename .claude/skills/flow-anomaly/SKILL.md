@@ -37,7 +37,14 @@ fails with `Permission denied`, say so and do not change permissions.
 2. **Processes, by risk.** The risk score adds 10 per high, 4 per medium, and 1 per low
    finding. Columns: connections, destinations, bytes up and down, top ports, top
    organisations.
-3. **Destinations, by organisation**, from the ASN organisation on close events.
+   `users` is the effective uid, `euid/uid` when they differ, and `<-auid` when the login
+   user is someone else: `0<-1013` is root run by user 1013 through `sudo`. `in` counts
+   inbound connections.
+3. **Inbound, by local port.** Connections the far side started (`direction: "in"`), by
+   the listening port they came to, with the busiest clients. They are left out of every
+   outbound check: an inbound flow's remote port is the client's ephemeral port, and its
+   bytes out are what this host served.
+4. **Destinations, by organisation**, from the ASN organisation on close events.
 
 ## Checks
 
@@ -81,6 +88,10 @@ fails with `Permission denied`, say so and do not change permissions.
   is empty.
 - Attribution is best effort, so a process name can be wrong. `(unknown)` is a signal,
   not proof.
+- Logs written before netwatch had the `direction` field count every flow as outbound. On a
+  host that serves traffic, inbound clients then look like `many-ports`, `new-destinations`
+  and `unattributed`. Large NATs (Anthropic's 160.79.104.0/21, carrier NAT) give their
+  clients ports in blocks, so multiples of 4096 there are real ports, not a parsing error.
 
 ## Privacy
 

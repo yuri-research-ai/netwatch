@@ -159,9 +159,15 @@ pub struct FlowEvent {
     pub proto: String,
     pub process: Option<String>,
     pub pid: Option<u32>,
+    #[serde(flatten)]
+    pub creds: Option<Creds>,
     pub attribution: AttributionSource,
     pub local: String,
     pub remote: String,
+    /// `"in"` when the far side connected to a listening socket here, `"out"`
+    /// otherwise. TCP only: UDP has no listening state to tell by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<&'static str>,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<CloseReason>,
@@ -194,6 +200,40 @@ pub struct FlowEvent {
     pub observed_by: &'static str,
 }
 
+/// Who a process runs as: real and effective uid, and the login uid (the
+/// user who logged in, kept across `sudo` and `su`; absent when unset, as for
+/// a daemon started at boot). From `/proc/<pid>/status` and
+/// `/proc/<pid>/loginuid`, which anyone may read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Creds {
+    pub uid: u32,
+    pub euid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auid: Option<u32>,
+}
+
+/// The credentials of a running process, `None` once it is gone.
+pub fn proc_creds(pid: u32) -> Option<Creds> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let loginuid = std::fs::read_to_string(format!("/proc/{pid}/loginuid")).ok();
+    parse_creds(&status, loginuid.as_deref())
+}
+
+fn parse_creds(status: &str, loginuid: Option<&str>) -> Option<Creds> {
+    let mut ids = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .map(|id| id.parse::<u32>().ok());
+    let uid = ids.next()??;
+    let euid = ids.next()??;
+    // (uid_t)-1 is "never set".
+    let auid = loginuid
+        .and_then(|l| l.trim().parse::<u32>().ok())
+        .filter(|&a| a != u32::MAX);
+    Some(Creds { uid, euid, auid })
+}
+
 /// One `connect()` the eBPF kprobes saw: TCP, or a connected UDP socket.
 /// The kernel has not picked the source address yet when they fire, so there
 /// is no local side.
@@ -201,8 +241,12 @@ pub struct FlowEvent {
 pub struct ConnectSeen {
     pub proto: &'static str,
     pub pid: u32,
-    /// The task's 15-character `comm`.
+    /// The process's 15-character `comm`: its main thread's.
     pub comm: String,
+    /// The connecting thread's `comm`, when it is not the process's.
+    pub thread: Option<String>,
+    /// Read when the event arrived; `None` if the process had already gone.
+    pub creds: Option<Creds>,
     pub remote: std::net::SocketAddr,
     pub wall: SystemTime,
 }
@@ -215,6 +259,12 @@ pub struct ConnectLine {
     pub proto: &'static str,
     pub process: String,
     pub pid: u32,
+    /// The thread that called `connect()`, when its name is not the
+    /// process's (a worker such as `ThreadPoolExecu`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    #[serde(flatten)]
+    pub creds: Option<Creds>,
     pub attribution: AttributionSource,
     /// The client side of the captured stream this connect started, when
     /// one was found.
@@ -390,6 +440,8 @@ fn connect_line(c: ConnectSeen, stream: Option<&WireStream>) -> ConnectLine {
         proto: c.proto,
         process: c.comm,
         pid: c.pid,
+        thread: c.thread,
+        creds: c.creds,
         attribution: AttributionSource::Ebpf,
         local: stream.map(|w| w.client.to_string()),
         remote: c.remote.to_string(),
@@ -476,7 +528,9 @@ struct FlowState {
     closed: bool,
     process: Option<String>,
     pid: Option<u32>,
+    creds: Option<Creds>,
     attribution: AttributionSource,
+    direction: Option<&'static str>,
     state: String,
     host: Option<String>,
     host_source: Option<&'static str>,
@@ -499,7 +553,9 @@ impl FlowState {
             closed: false,
             process: None,
             pid: None,
+            creds: None,
             attribution,
+            direction: None,
             state: String::new(),
             host: None,
             host_source: None,
@@ -523,6 +579,7 @@ pub struct FlowTracker {
     loopback: bool,
     last_observe: Option<Instant>,
     tick: u64,
+    creds: fn(u32) -> Option<Creds>,
 }
 
 impl FlowTracker {
@@ -532,6 +589,8 @@ impl FlowTracker {
             loopback,
             last_observe: None,
             tick: 0,
+            // Unit tests' pids are made up; a live one must not leak in.
+            creds: if cfg!(test) { |_| None } else { proc_creds },
         }
     }
 
@@ -590,6 +649,7 @@ impl FlowTracker {
             remote: String::new(),
         };
 
+        let listening = Listening::from(connections);
         for conn in connections {
             let Some(remote_ip) = loggable_remote(conn, self.loopback) else {
                 continue;
@@ -599,14 +659,21 @@ impl FlowTracker {
             key.remote.clone_from(&conn.remote_addr);
             let is_new = !self.flows.contains_key(&key);
             if is_new {
-                self.flows
-                    .insert(key.clone(), FlowState::new(now, conn.attribution));
+                let mut flow = FlowState::new(now, conn.attribution);
+                flow.direction = listening.direction(conn);
+                self.flows.insert(key.clone(), flow);
             }
             let Some(flow) = self.flows.get_mut(&key) else {
                 continue;
             };
             flow.seen = tick;
+            let pid = flow.pid;
             update(flow, conn, remote_ip, elapsed, rdns, geo, hint, dns_name);
+            // Read once per owner, when it is learned: the process may be
+            // gone by the close.
+            if flow.pid.is_some() && flow.pid != pid {
+                flow.creds = flow.pid.and_then(self.creds);
+            }
             if is_new {
                 events.push(event(&key, flow, FlowEventKind::Open, &ts, now, None));
             }
@@ -671,6 +738,50 @@ impl FlowTracker {
         events.sort_by(|a, b| (&a.remote, &a.local).cmp(&(&b.remote, &b.local)));
         events
     }
+}
+
+/// The listening TCP sockets of one table, to tell an accepted connection
+/// from one this host started: `(port, address)`, `None` for a wildcard.
+struct Listening(std::collections::HashSet<(u16, Option<std::net::IpAddr>)>);
+
+impl Listening {
+    fn from(connections: &[Connection]) -> Self {
+        let set = connections
+            .iter()
+            .filter(|c| c.protocol == "TCP" && c.state.eq_ignore_ascii_case("LISTEN"))
+            .filter_map(|c| {
+                let (ip, port) = endpoint(&c.local_addr)?;
+                Some((port, ip.filter(|ip| !ip.is_unspecified())))
+            })
+            .collect();
+        Self(set)
+    }
+
+    /// Set once, when the flow opens: the listener can close before the
+    /// connections it accepted do.
+    fn direction(&self, conn: &Connection) -> Option<&'static str> {
+        if conn.protocol != "TCP" {
+            return None;
+        }
+        let (ip, port) = endpoint(&conn.local_addr)?;
+        let accepted = self.0.contains(&(port, None))
+            || ip.is_some_and(|ip| self.0.contains(&(port, Some(ip))));
+        Some(if accepted { "in" } else { "out" })
+    }
+}
+
+/// An address's IP, canonical (v4-mapped to v4, zone dropped), and port.
+/// The IP is `None` for a wildcard such as lsof's `*`.
+fn endpoint(addr: &str) -> Option<(Option<std::net::IpAddr>, u16)> {
+    let (ip, port) = crate::app::addr_parts(addr);
+    let port = port?.parse().ok()?;
+    let ip = ip.and_then(|ip| {
+        ip.split('%')
+            .next()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
+    });
+    Some((ip, port))
 }
 
 /// The remote IP of a connection worth logging: one with a peer, not a
@@ -802,9 +913,11 @@ fn event(
         proto: key.proto.clone(),
         process: flow.process.clone(),
         pid: flow.pid,
+        creds: flow.creds,
         attribution: flow.attribution,
         local: key.local.clone(),
         remote: key.remote.clone(),
+        direction: flow.direction,
         state: flow.state.clone(),
         reason,
         duration_ms: close.then(|| now.duration_since(flow.opened).as_millis() as u64),
@@ -945,6 +1058,8 @@ pub struct DnsLine {
     pub proto: &'static str,
     pub process: Option<String>,
     pub pid: Option<u32>,
+    #[serde(flatten)]
+    pub creds: Option<Creds>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attribution: Option<AttributionSource>,
     pub local: String,
@@ -1107,6 +1222,7 @@ fn dns_line(p: PendingDns, owner: SocketOwner) -> DnsLine {
         proto: "UDP",
         process,
         pid,
+        creds: None,
         attribution,
         local: p.client.to_string(),
         server: p.server.to_string(),
@@ -1291,7 +1407,10 @@ impl DaemonFlowLog {
                     .map(|(pid, name, _)| (*pid, name.clone(), AttributionSource::Ebpf))
             })
         };
-        let lines = self.dns.tick(&owner, all);
+        let mut lines = self.dns.tick(&owner, all);
+        for line in &mut lines {
+            line.creds = line.pid.and_then(proc_creds);
+        }
         self.writer.send(&lines);
     }
 
@@ -1690,6 +1809,110 @@ mod tests {
 
     const LOCAL: &str = "10.0.0.5:51234";
     const REMOTE: &str = "142.250.66.101:443";
+
+    /// A connection to a listening port here is inbound, through a wildcard
+    /// or an address listener, v4-mapped or not; any other TCP is outbound,
+    /// and UDP has no direction.
+    #[test]
+    fn a_flow_to_a_listening_port_is_inbound() {
+        let clock = Clock::new();
+        let mut t = FlowTracker::new(false);
+        let mut udp = conn("10.0.0.5:40000", "1.1.1.1:443", "");
+        udp.protocol = "UDP".into();
+        let table = [
+            conn("0.0.0.0:443", "*:*", "LISTEN"),
+            conn("10.0.0.5:9090", "0.0.0.0:*", "LISTEN"),
+            conn("10.0.0.5:443", "160.79.106.29:16384", "ESTABLISHED"),
+            conn(
+                "[::ffff:10.0.0.5]:9090",
+                "[::ffff:198.51.100.7]:50000",
+                "ESTABLISHED",
+            ),
+            conn("10.0.0.6:9090", "198.51.100.7:50001", "ESTABLISHED"),
+            conn(LOCAL, REMOTE, "ESTABLISHED"),
+            udp,
+        ];
+        let dirs: Vec<_> = observe(&mut t, &clock, 0, &table)
+            .into_iter()
+            .map(|e| (e.local, e.direction))
+            .collect();
+        assert_eq!(
+            dirs,
+            [
+                ("10.0.0.5:443".to_string(), Some("in")),
+                ("[::ffff:10.0.0.5]:9090".to_string(), Some("in")),
+                ("10.0.0.6:9090".to_string(), Some("out")),
+                (LOCAL.to_string(), Some("out")),
+                ("10.0.0.5:40000".to_string(), None),
+            ]
+        );
+        // The listener closes; its connection stays inbound.
+        let closed = observe(
+            &mut t,
+            &clock,
+            1,
+            &[conn("10.0.0.5:443", "160.79.106.29:16384", "TIME_WAIT")],
+        );
+        assert_eq!(closed[0].direction, Some("in"));
+    }
+
+    #[test]
+    fn creds_are_read_from_status_and_loginuid() {
+        let status =
+            "Name:\tsudo\nUmask:\t0022\nUid:\t1013\t0\t0\t0\nGid:\t1013\t1013\t1013\t1013\n";
+        assert_eq!(
+            parse_creds(status, Some("1013\n")),
+            Some(Creds {
+                uid: 1013,
+                euid: 0,
+                auid: Some(1013)
+            })
+        );
+        assert_eq!(
+            parse_creds(status, Some("4294967295")),
+            Some(Creds {
+                uid: 1013,
+                euid: 0,
+                auid: None
+            })
+        );
+        assert_eq!(parse_creds("Name:\tx\n", None), None);
+        assert_eq!(parse_creds("Uid:\t1\n", None), None);
+    }
+
+    /// The owner's ids are read once, when the owner is learned, and kept
+    /// to the close even if the process is gone by then.
+    #[test]
+    fn a_flow_carries_its_owners_ids() {
+        let clock = Clock::new();
+        let mut t = FlowTracker::new(false);
+        t.creds = |pid| {
+            (pid == 4242).then_some(Creds {
+                uid: 1013,
+                euid: 1013,
+                auid: Some(1013),
+            })
+        };
+        let open = observe(&mut t, &clock, 0, &[conn(LOCAL, REMOTE, "ESTABLISHED")]);
+        let json = serde_json::to_value(&open[0]).unwrap();
+        assert_eq!(
+            (
+                json["uid"].clone(),
+                json["euid"].clone(),
+                json["auid"].clone()
+            ),
+            (1013.into(), 1013.into(), 1013.into())
+        );
+        t.creds = |_| None;
+        let close = observe(&mut t, &clock, 1, &[]);
+        assert_eq!(close[0].creds.map(|c| c.uid), Some(1013));
+        // No owner, no ids, and no keys for them.
+        let mut bare = conn("10.0.0.5:2", REMOTE, "ESTABLISHED");
+        bare.pid = None;
+        bare.process_name = None;
+        let json = serde_json::to_value(&observe(&mut t, &clock, 2, &[bare])[0]).unwrap();
+        assert!(json.get("uid").is_none());
+    }
 
     #[test]
     fn a_new_connection_opens_once() {
@@ -2093,6 +2316,8 @@ mod tests {
             proto,
             pid: 4242,
             comm: "curl".into(),
+            thread: None,
+            creds: None,
             remote: remote.parse().unwrap(),
             wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
         }

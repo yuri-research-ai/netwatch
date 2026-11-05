@@ -204,7 +204,7 @@ impl Repeats {
 }
 
 impl Tap {
-    fn send(&self, evt: &ConnectEvent) {
+    fn send(&self, evt: &ConnectEvent, thread: Option<String>) {
         if self.repeats.lock().is_ok_and(|mut r| r.is_repeat(evt)) {
             return;
         }
@@ -217,6 +217,8 @@ impl Tap {
             },
             pid: evt.tgid,
             comm: evt.comm.clone(),
+            thread,
+            creds: crate::collectors::flow_log::proc_creds(evt.tgid),
             remote: std::net::SocketAddr::new(evt.daddr, evt.dport),
             // The kernel's own clock for the probe, converted by the SDK.
             wall: SystemTime::from(evt.timestamp),
@@ -309,9 +311,12 @@ impl ConnTracker {
                 // recv_timeout so the loop checks the stop flag even
                 // when the kprobe is silent for long stretches.
                 match rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(EbpfEvent::Connect(evt)) => {
+                    Ok(EbpfEvent::Connect(mut evt)) => {
                         if !evt.daddr.is_unspecified() && evt.dport != 0 {
-                            thread_tap.send(&evt);
+                            let process = process_comm(&evt, read_proc_comm);
+                            let thread = (process != evt.comm)
+                                .then(|| std::mem::replace(&mut evt.comm, process));
+                            thread_tap.send(&evt, thread);
                         }
                         record_connect(&thread_attr, evt)
                     }
@@ -355,6 +360,25 @@ impl Drop for ConnTracker {
             let _ = worker.join();
         }
     }
+}
+
+/// The process's name for a connect, not its thread's. `comm` is the calling
+/// task's, so a connect from a worker thread arrives as `ThreadPoolExecu` or
+/// `Thread-4`. The thread-group leader's comm names the process; it is in
+/// `/proc/<tgid>/comm`, which anyone may read. A process gone before the read
+/// keeps the thread's name.
+fn process_comm(evt: &ConnectEvent, read: impl Fn(u32) -> Option<String>) -> String {
+    if evt.tgid == evt.pid {
+        return evt.comm.clone();
+    }
+    read(evt.tgid)
+        .map(|c| c.trim_end_matches('\n').to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| evt.comm.clone())
+}
+
+fn read_proc_comm(tgid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{tgid}/comm")).ok()
 }
 
 fn record_connect(attributor: &Arc<EbpfAttributor>, evt: ConnectEvent) {
@@ -544,6 +568,21 @@ mod freshness_tests {
         }
     }
 
+    #[test]
+    fn a_worker_threads_connect_is_named_after_its_process() {
+        let leader = |tgid: u32| (tgid == 100).then(|| "gunicorn\n".to_string());
+        let mut evt = event(117, 443, 0);
+        evt.comm = "ThreadPoolExecu".into();
+        assert_eq!(process_comm(&evt, leader), "gunicorn");
+        // The leader itself needs no read.
+        let mut main = event(100, 443, 0);
+        main.comm = "python3".into();
+        assert_eq!(process_comm(&main, |_| panic!("read")), "python3");
+        // The process is gone: the thread's name stays.
+        assert_eq!(process_comm(&evt, |_| None), "ThreadPoolExecu");
+        assert_eq!(process_comm(&evt, |_| Some("\n".into())), "ThreadPoolExecu");
+    }
+
     /// The wrapper and inner probes' copies of one connect are one; a second
     /// connect, another thread, or another destination is not.
     #[test]
@@ -564,7 +603,7 @@ mod freshness_tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         *tap.tx.lock().unwrap() = Some(tx);
         for e in [event(1, 443, 0), event(1, 443, 1), event(1, 443, 500)] {
-            tap.send(&e);
+            tap.send(&e, None);
         }
         let seen: Vec<_> = rx.try_iter().collect();
         assert_eq!(seen.len(), 2);

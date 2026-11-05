@@ -542,7 +542,9 @@ tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.eve
   {"ts":"2026-11-05T10:00:01.012Z","event":"connect","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","remote":"93.184.215.14:443","observed_by":"ebpf"}
   ```
 
-  `process` is the kernel's 15-character `comm`. The probes fire before the kernel picks the
+  `process` is the process's 15-character `comm`, its main thread's; when another thread
+  called `connect()`, its name is in `thread` (`"process":"gunicorn","thread":"ThreadPoolExecu"`).
+  The probes fire before the kernel picks the
   source port, so the line waits up to two ticks for packet capture to see the stream the connect
   started (same transport and destination, begun after the connect, started from this side, not
   taken by an earlier connect) and takes its `local` and, from the ClientHello, `host`:
@@ -579,6 +581,16 @@ tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.eve
   answer from before netwatch started, or an interface capture does not listen on. An
   application asking `systemd-resolved` on `127.0.0.53` talks over loopback; the line capture
   sees is the resolver's own query upstream, named `systemd-resolve`.
+- **Direction.** A TCP `open` or `close` has `"direction":"in"` when its local side is a port
+  a socket listens on, so the far side connected here and `remote` holds the client's
+  ephemeral port; otherwise `"out"`. It is decided when the flow opens. UDP has no listening
+  state and no `direction`. A `connect` line is always outbound.
+- **Who.** `connect`, `open`, `close` and `dns` lines with a known owner have its `uid`,
+  `euid` and, when set, `auid`: real and effective user id from `/proc/<pid>/status`, and the
+  login uid from `/proc/<pid>/loginuid`, the user who logged in, kept across `sudo` and `su`
+  (`"uid":0,"euid":0,"auid":1013` is root, run by user 1013). They are read when the owner is
+  learned: for a `connect` as the event arrives, for a flow when it opens. A process gone by
+  then has none. Numbers only; map them to names with `getent passwd`.
 - **What it skips.** Listening and unconnected sockets, and loopback unless
   `flow_log_loopback = true`.
 - **Limits.** The log is built from the connection table, polled every `refresh_rate_ms`.

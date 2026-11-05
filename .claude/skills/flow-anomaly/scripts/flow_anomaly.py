@@ -141,6 +141,27 @@ def is_service_discovery(qname: str) -> bool:
     return any(lbl.startswith("_") for lbl in qname.split("."))
 
 
+def is_outbound(e: dict) -> bool:
+    """A connection this host started. `direction: "in"` marks one the far side
+    started to a listening port here: its remote port is the client's, and it
+    says nothing about where this host goes. Logs older than the field have no
+    direction, and count as outbound."""
+    return e["event"] in CONN_TYPES and e.get("direction") != "in"
+
+
+def outgoing(e: dict) -> bool:
+    return is_outbound(e) and bool(e.get("remote"))
+
+
+def user_of(e: dict) -> str:
+    """`1013`, or `0<-1013` when someone logged in as 1013 runs it as root."""
+    uid, euid, auid = e.get("uid"), e.get("euid"), e.get("auid")
+    if euid is None:
+        return ""
+    who = str(euid if uid == euid else f"{euid}/{uid}")
+    return f"{who}<-{auid}" if auid is not None and auid != uid else who
+
+
 def dest_of(e: dict) -> tuple[str, int | None]:
     ip, port = split_addr(e.get("remote") or "")
     try:
@@ -154,7 +175,7 @@ def dest_of(e: dict) -> tuple[str, int | None]:
 
 def classify(e: dict) -> list[tuple[str, str]]:
     """Return (tag, severity) pairs for one connection event. Tags aggregate later."""
-    if e["event"] not in CONN_TYPES:
+    if not is_outbound(e):
         return []
     ip, port = dest_of(e)
     if not ip or not is_public(ip):
@@ -212,11 +233,11 @@ def check_dns_resolvers(recent: list[dict], out: list[dict]) -> None:
 def check_new_destinations(recent, base, out, t):
     seen: dict[str, set[str]] = collections.defaultdict(set)
     for e in base:
-        if e["event"] in CONN_TYPES and e.get("remote"):
+        if outgoing(e):
             seen[proc(e)].add(dest_of(e)[0])
     new: dict[str, dict[str, str]] = collections.defaultdict(dict)
     for e in recent:
-        if e["event"] in CONN_TYPES and e.get("remote"):
+        if outgoing(e):
             ip = dest_of(e)[0]
             if ip not in seen[proc(e)]:
                 new[proc(e)].setdefault(ip, name_of(e))
@@ -232,7 +253,8 @@ def check_volume(recent, base, rec_h, base_h, out, t):
     def upload_by_proc(evs):
         totals: collections.Counter = collections.Counter()
         for e in evs:
-            if e["event"] == "close":
+            # An inbound flow's bytes out are what this host served.
+            if e["event"] == "close" and is_outbound(e):
                 totals[proc(e)] += int(e.get("bytes_out") or 0)
         return totals
 
@@ -255,7 +277,7 @@ def check_volume(recent, base, rec_h, base_h, out, t):
 def check_beacons(recent, out, t):
     times: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
     for e in recent:
-        if e["event"] in ("open", "connect") and e.get("remote"):
+        if e["event"] in ("open", "connect") and outgoing(e):
             ip = dest_of(e)[0]
             if is_public(ip):
                 times[(proc(e), ip)].append(e["ts"].timestamp())
@@ -282,7 +304,7 @@ def check_fanout(recent, out, t):
     hosts: dict[str, set[str]] = collections.defaultdict(set)
     ports: dict[tuple[str, str], set[int | None]] = collections.defaultdict(set)
     for e in recent:
-        if e["event"] in ("open", "connect") and e.get("remote"):
+        if e["event"] in ("open", "connect") and outgoing(e):
             ip, port = dest_of(e)
             hosts[proc(e)].add(ip)
             ports[(proc(e), ip)].add(port)
@@ -360,13 +382,17 @@ def check_dropped(recent, out):
 
 def group_by_process(recent: list[dict]) -> dict[str, dict]:
     groups: dict[str, dict] = collections.defaultdict(
-        lambda: {"opens": 0, "dests": set(), "ports": collections.Counter(),
-                 "orgs": collections.Counter(), "up": 0, "down": 0})
+        lambda: {"opens": 0, "inbound": 0, "dests": set(), "ports": collections.Counter(),
+                 "orgs": collections.Counter(), "users": collections.Counter(), "up": 0, "down": 0})
     for e in recent:
         g = groups[proc(e)]
+        if user_of(e):
+            g["users"][user_of(e)] += 1
         if e["event"] == "open":
             g["opens"] += 1
-        if e["event"] in CONN_TYPES and e.get("remote"):
+            if not is_outbound(e):
+                g["inbound"] += 1
+        if outgoing(e):
             ip, port = dest_of(e)
             g["dests"].add(ip)
             if port is not None:
@@ -388,12 +414,28 @@ def group_by_org(recent: list[dict]) -> dict[str, dict]:
             continue
         o = orgs[org]
         o["procs"][proc(e)] += 1
-        if e["event"] in CONN_TYPES and e.get("remote"):
+        if outgoing(e):
             o["dests"].add(dest_of(e)[0])
         if e["event"] == "close":
             o["up"] += int(e.get("bytes_out") or 0)
             o["down"] += int(e.get("bytes_in") or 0)
     return orgs
+
+
+def group_inbound(recent: list[dict]) -> list[dict]:
+    """Connections the far side started, by the local port they came to."""
+    ports: dict[tuple[str, str], dict] = collections.defaultdict(
+        lambda: {"opens": 0, "clients": collections.Counter()})
+    for e in recent:
+        if e["event"] == "open" and not is_outbound(e):
+            g = ports[(proc(e), split_addr(e.get("local") or "")[1])]
+            g["opens"] += 1
+            g["clients"][dest_of(e)[0]] += 1
+    return [
+        {"process": p, "port": port, "opens": g["opens"], "clients": len(g["clients"]),
+         "top_clients": g["clients"].most_common(3)}
+        for (p, port), g in sorted(ports.items(), key=lambda kv: -kv[1]["opens"])
+    ]
 
 
 def risk_by_process(findings: list[dict]) -> collections.Counter:
@@ -445,11 +487,13 @@ def analyse(events: list[dict], args: argparse.Namespace) -> dict:
         },
         "findings": findings,
         "processes": [
-            {"process": p, "risk": risk.get(p, 0), "opens": g["opens"], "destinations": len(g["dests"]),
+            {"process": p, "risk": risk.get(p, 0), "opens": g["opens"], "inbound": g["inbound"],
+             "destinations": len(g["dests"]), "users": [u for u, _ in g["users"].most_common(3)],
              "up": g["up"], "down": g["down"],
              "top_ports": g["ports"].most_common(3), "top_orgs": g["orgs"].most_common(3)}
             for p, g in sorted(procs.items(), key=lambda kv: (-risk.get(kv[0], 0), -kv[1]["up"]))
         ],
+        "inbound": group_inbound(recent)[: args.top],
         "organisations": [
             {"org": org, "processes": o["procs"].most_common(5), "destinations": len(o["dests"]),
              "up": o["up"], "down": o["down"]}
@@ -480,12 +524,23 @@ def render(report: dict, stats: collections.Counter, top: int) -> str:
 
     lines.append("")
     lines.append("== Processes, by risk ==")
-    lines.append(f"{'process':<22}{'risk':>6}{'conns':>8}{'dests':>7}{'up':>11}{'down':>11}  top ports / orgs")
+    lines.append(f"{'process':<22}{'users':<14}{'risk':>6}{'conns':>8}{'in':>6}{'dests':>7}{'up':>11}{'down':>11}"
+                 "  top ports / orgs")
     for p in report["processes"][:top]:
         ports = ", ".join(f"{port}:{n}" for port, n in p["top_ports"])
         orgs = ", ".join(f"{org}({n})" for org, n in p["top_orgs"])
-        lines.append(f"{p['process'][:21]:<22}{p['risk']:>6}{p['opens']:>8}{p['destinations']:>7}"
-                     f"{human(p['up']):>11}{human(p['down']):>11}  {ports} | {orgs}")
+        users = ",".join(p["users"])
+        lines.append(f"{p['process'][:21]:<22}{users[:13]:<14}{p['risk']:>6}{p['opens']:>8}{p['inbound']:>6}"
+                     f"{p['destinations']:>7}{human(p['up']):>11}{human(p['down']):>11}  {ports} | {orgs}")
+
+    lines.append("")
+    lines.append("== Inbound, by local port ==")
+    lines.append(f"{'process':<22}{'port':>7}{'conns':>8}{'clients':>9}  top clients")
+    if not report["inbound"]:
+        lines.append("none (or a log older than the direction field)")
+    for i in report["inbound"]:
+        clients = ", ".join(f"{ip}({n})" for ip, n in i["top_clients"])
+        lines.append(f"{i['process'][:21]:<22}{i['port']:>7}{i['opens']:>8}{i['clients']:>9}  {clients}")
 
     lines.append("")
     lines.append("== Destinations, by organisation ==")
