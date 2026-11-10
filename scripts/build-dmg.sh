@@ -2,13 +2,15 @@
 # Build a macOS (Apple Silicon) .dmg with the netwatch binary, the launchd
 # daemon definition and an installer.
 #
-#   scripts/build-dmg.sh [DMG_VERSION]   # default: <crate version>+flowlog5
-#   -> target/dmg/netwatch-<DMG_VERSION>-macos-arm64.dmg
+#   scripts/build-dmg.sh [--arch arm64|x86_64] [DMG_VERSION]
+#   default: arm64, <crate version>+flowlog6
+#   -> target/dmg/netwatch-<DMG_VERSION>-macos-<arch>.dmg
 #
 # The crate version in Cargo.toml is unchanged; the suffix marks our build, the
 # same way the .deb does (dist/netwatch_0.40.0+flowlog4_amd64.deb).
 #
-# Must run on macOS arm64: it uses hdiutil, plutil and builds for the host target.
+# Runs on any Mac. It builds the chosen arch with --target, so the Intel build
+# also works on Apple Silicon once: rustup target add x86_64-apple-darwin
 # Needs a Rust toolchain >= the crate's rust-version (rustup is enough).
 # Nothing here runs as root or changes anything outside target/.
 set -euo pipefail
@@ -17,22 +19,39 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 [ "$(uname -s)" = Darwin ] || { echo "run this on macOS" >&2; exit 1; }
-[ "$(uname -m)" = arm64 ] || { echo "this script builds for Apple Silicon (arm64) only" >&2; exit 1; }
+ARCH=arm64
+if [ "${1:-}" = "--arch" ]; then
+    ARCH="${2:?--arch needs a value}"
+    shift 2
+fi
+case "$ARCH" in
+    arm64) TRIPLE=aarch64-apple-darwin; LABEL="Apple Silicon" ;;
+    x86_64) TRIPLE=x86_64-apple-darwin; LABEL="Intel" ;;
+    *) echo "unknown arch '$ARCH' (use arm64 or x86_64)" >&2; exit 1 ;;
+esac
+command -v lipo >/dev/null || { echo "lipo not found (Xcode command line tools)" >&2; exit 1; }
 command -v hdiutil >/dev/null || { echo "hdiutil not found" >&2; exit 1; }
 command -v plutil >/dev/null || { echo "plutil not found" >&2; exit 1; }
 command -v cargo >/dev/null || { echo "cargo not on PATH" >&2; exit 1; }
 
 CRATE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-VERSION="${1:-${CRATE_VERSION}+flowlog5}"
+VERSION="${1:-${CRATE_VERSION}+flowlog6}"
 DMG_DIR="$ROOT/target/dmg"
 STAGE="$DMG_DIR/stage"
-DMG="$DMG_DIR/netwatch-${VERSION}-macos-arm64.dmg"
+DMG="$DMG_DIR/netwatch-${VERSION}-macos-${ARCH}.dmg"
+BIN="$ROOT/target/${TRIPLE}/release/netwatch"
 
-cargo build --release --locked --bin netwatch
+if command -v rustup >/dev/null && ! rustup target list --installed | grep -qx "$TRIPLE"; then
+    echo "missing rust target: rustup target add $TRIPLE" >&2
+    exit 1
+fi
+
+cargo build --release --locked --bin netwatch --target "$TRIPLE"
+[ "$(lipo -archs "$BIN")" = "$ARCH" ] || { echo "binary is not $ARCH" >&2; exit 1; }
 
 rm -rf "$STAGE" "$DMG"
 mkdir -p "$STAGE"
-install -m 0755 "$ROOT/target/release/netwatch" "$STAGE/netwatch"
+install -m 0755 "$BIN" "$STAGE/netwatch"
 
 # The daemon plist. Written here rather than copied from packaging/launchd: that
 # copy carries a placeholder remote endpoint and API key, and this one runs the
@@ -119,7 +138,7 @@ EOF
 chmod 0755 "$STAGE/Install netwatch.command"
 
 cat > "$STAGE/README.txt" <<EOF
-netwatch ${VERSION} for macOS (Apple Silicon)
+netwatch ${VERSION} for macOS (${LABEL})
 
 Install: double-click "Install netwatch.command". It copies netwatch to /usr/local/bin
 and, if you answer y, starts it as a background daemon at boot. The daemon writes
